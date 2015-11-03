@@ -11,8 +11,6 @@ import (
 	"github.com/ipfs/go-ipfs/blocks/key"
 	"github.com/ipfs/go-ipfs/core"
 	"github.com/ipfs/go-ipfs/core/mock"
-
-	"github.com/cheekybits/is"
 )
 
 type testSession struct {
@@ -26,19 +24,16 @@ func newTestSession(t *testing.T, writable bool) *testSession {
 	if err != nil {
 		t.Fatalf("coremock.NewMockNode() failed: %s", err)
 	}
-
 	tk, err := assets.SeedInitDocs(mn)
 	if err != nil {
 		t.Fatalf("assets.SeedInitDocs() failed: %s", err)
 	}
-
 	gwh, err := newGatewayHandler(mn, GatewayConfig{Writable: writable})
 	if err != nil {
 		t.Fatalf("newGatewayHandler() failed: %s", err)
 	}
 	serveMux := http.NewServeMux()
 	serveMux.Handle("/", gwh)
-
 	return &testSession{
 		key: tk,
 		mn:  mn,
@@ -48,18 +43,26 @@ func newTestSession(t *testing.T, writable bool) *testSession {
 
 func TestGateway_GET(t *testing.T) {
 	ts := newTestSession(t, false)
-	is := is.New(t)
 	resp, err := ts.hc.Get("/ipfs/" + ts.key.B58String() + "/about")
-	is.Nil(err)
-	is.Equal(resp.StatusCode, http.StatusOK)
+	if err != nil {
+		t.Fatalf("http GET failed with err: %s", err)
+	}
+	got, want := resp.StatusCode, http.StatusOK
+	if got != want {
+		t.Errorf("http GET returned wrong status code. wanted %d got %d %s", want, got, resp.Status)
+	}
 }
 
 func TestGateway_POSTwDisabled(t *testing.T) {
 	ts := newTestSession(t, false)
-	is := is.New(t)
 	resp, err := ts.hc.Post("/ipfs/"+ts.key.B58String()+"/new", "test", nil)
-	is.Nil(err)
-	is.Equal(resp.StatusCode, http.StatusMethodNotAllowed)
+	if err != nil {
+		t.Fatalf("http POST failed with err: %s", err)
+	}
+	got, want := resp.StatusCode, http.StatusMethodNotAllowed
+	if got != want {
+		t.Errorf("http POST returned wrong status code. wanted %d got %d %s", want, got, resp.Status)
+	}
 }
 
 func TestGateway_Meaningful(t *testing.T) {
@@ -74,10 +77,11 @@ func TestGateway_Meaningful(t *testing.T) {
 		// whose name (in this case: hash) is determined by the gateway and receives the response:
 		{"POST", "/ipfs", http.StatusCreated, []byte("Hello World"), "/ipfs/QmUXTtySmd7LD4p6RG6rZW6RuUuPZXTtNMmRQ6DSQo3aMw"},
 
-		// TODO(cryptix): figure out how to specify the file/link name
-		{"POST", "/ipfs/" + ts.key.B58String(), http.StatusCreated, []byte("Hello World"), "/ipfs/QmUXTtySmd7LD4p6RG6rZW6RuUuPZXTtNMmRQ6DSQo3aMw"},
+		// creates or overwrites newFile on key
+		{"POST", "/ipfs/" + ts.key.B58String() + "/newFile", http.StatusCreated, []byte("Hello World"), "/ipfs/QmSN6DYGcb98NqAxN3FW8nJdcJquGFLu64fPVcfbFVdHJc"},
 
-		{"DELETE", "/ipfs/" + ts.key.B58String() + "/about", http.StatusCreated, []byte{}, "/ipfs/test"},
+		// removes the link to about from key
+		{"DELETE", "/ipfs/" + ts.key.B58String() + "/about", http.StatusCreated, []byte{}, "/ipfs/QmNjJ3naRhHCn14E895R1xtGmDgKQb8vnVvQar6RrnraC1"},
 	}
 	for i, tcase := range tcases {
 		req, err := http.NewRequest(tcase.Method, tcase.URL, bytes.NewReader(tcase.Body))
@@ -94,7 +98,6 @@ func TestGateway_Meaningful(t *testing.T) {
 				t.Logf("response body: %q", b)
 			}
 		}
-
 		if got := resp.Header.Get("Location"); got != tcase.Location {
 			t.Errorf("case %d: location mismatch: want: %s. got: %s", i, tcase.Location, got)
 		}
