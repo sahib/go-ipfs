@@ -55,16 +55,20 @@ func (i *gatewayHandler) newDagFromReader(r io.Reader) (*dag.Node, error) {
 
 // TODO(btc): break this apart into separate handlers using a more expressive muxer
 func (i *gatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithCancel(i.node.Context())
+	defer cancel()
+
 	if i.config.Writable {
 		switch r.Method {
 		case "POST":
-			i.postHandler(w, r)
+			i.postHandler(ctx, w, r)
 			return
 		case "PUT":
-			i.putHandler(w, r)
+			// TODO(cryptix): where are the docs?
+			http.Error(w, "writableGateway: PUT method not meaningful on IPFS - use POST and see the docs", http.StatusMethodNotAllowed)
 			return
 		case "DELETE":
-			i.deleteHandler(w, r)
+			i.deleteHandler(ctx, w, r)
 			return
 		}
 	}
@@ -97,11 +101,11 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	// and links that match the requested URL.
 	// For example, http://example.net would become /ipns/example.net, and
 	// the redirects and links would end up as http://example.net/ipns/example.net
-	originalUrlPath := urlPath
+	originalURLPath := urlPath
 	ipnsHostname := false
 	hdr := r.Header["X-IPNS-Original-Path"]
 	if len(hdr) > 0 {
-		originalUrlPath = hdr[0]
+		originalURLPath = hdr[0]
 		ipnsHostname = true
 	}
 
@@ -176,9 +180,9 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 			foundIndex = true
 
 			if urlPath[len(urlPath)-1] != '/' {
-				// See comment above where originalUrlPath is declared.
-				http.Redirect(w, r, originalUrlPath+"/", 302)
-				log.Debugf("redirect to %s", originalUrlPath+"/")
+				// See comment above where originalURLPath is declared.
+				http.Redirect(w, r, originalURLPath+"/", 302)
+				log.Debugf("redirect to %s", originalURLPath+"/")
 				return
 			}
 
@@ -202,8 +206,8 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 			break
 		}
 
-		// See comment above where originalUrlPath is declared.
-		di := directoryItem{humanize.Bytes(link.Size), link.Name, gopath.Join(originalUrlPath, link.Name)}
+		// See comment above where originalURLPath is declared.
+		di := directoryItem{humanize.Bytes(link.Size), link.Name, gopath.Join(originalURLPath, link.Name)}
 		dirListing = append(dirListing, di)
 	}
 
@@ -211,7 +215,7 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 		if r.Method != "HEAD" {
 			// construct the correct back link
 			// https://github.com/ipfs/go-ipfs/issues/1365
-			var backLink string = urlPath
+			var backLink = urlPath
 
 			// don't go further up than /ipfs/$hash/
 			pathSplit := strings.Split(backLink, "/")
@@ -241,10 +245,10 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 				}
 			}
 
-			// See comment above where originalUrlPath is declared.
+			// See comment above where originalURLPath is declared.
 			tplData := listingTemplateData{
 				Listing:  dirListing,
-				Path:     originalUrlPath,
+				Path:     originalURLPath,
 				BackLink: backLink,
 			}
 			err := listingTemplate.Execute(w, tplData)
@@ -256,38 +260,16 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (i *gatewayHandler) postHandler(w http.ResponseWriter, r *http.Request) {
-	nd, err := i.newDagFromReader(r.Body)
-	if err != nil {
-		internalWebError(w, err)
-		return
-	}
-
-	k, err := i.node.DAG.Add(nd)
-	if err != nil {
-		internalWebError(w, err)
-		return
-	}
-
-	i.addUserHeaders(w) // ok, _now_ write user's headers.
-	w.Header().Set("IPFS-Hash", k.String())
-	http.Redirect(w, r, ipfsPathPrefix+k.String(), http.StatusCreated)
-}
-
-func (i *gatewayHandler) putHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO(cryptix): move me to ServeHTTP and pass into all handlers
-	ctx, cancel := context.WithCancel(i.node.Context())
-	defer cancel()
-
+func (i *gatewayHandler) postHandler(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	rootPath, err := path.ParsePath(r.URL.Path)
 	if err != nil {
-		webError(w, "putHandler: ipfs path not valid", err, http.StatusBadRequest)
+		webError(w, "postHandler: ipfs path not valid", err, http.StatusBadRequest)
 		return
 	}
 
 	rsegs := rootPath.Segments()
 	if rsegs[0] == ipnsPathPrefix {
-		webError(w, "putHandler: updating named entries not supported", errors.New("WritableGateway: ipns put not supported"), http.StatusBadRequest)
+		webError(w, "postHandler: updating named entries not supported", ErrIPNSNotSupported, http.StatusBadRequest)
 		return
 	}
 
@@ -297,7 +279,7 @@ func (i *gatewayHandler) putHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		putNode, err := i.newDagFromReader(r.Body)
 		if err != nil {
-			webError(w, "putHandler: Could not create DAG from request", err, http.StatusInternalServerError)
+			webError(w, "postHandler: Could not create DAG from request", err, http.StatusInternalServerError)
 			return
 		}
 		newnode = putNode
@@ -305,7 +287,7 @@ func (i *gatewayHandler) putHandler(w http.ResponseWriter, r *http.Request) {
 
 	var newPath string
 	if len(rsegs) > 1 {
-		newPath = strings.Join(rsegs[2:], "/")
+		newPath = gopath.Join(rsegs[2:]...)
 	}
 
 	var newkey key.Key
@@ -317,20 +299,20 @@ func (i *gatewayHandler) putHandler(w http.ResponseWriter, r *http.Request) {
 		// but we need to patch from the root
 		rnode, err := i.node.DAG.Get(ctx, key.B58KeyDecode(rsegs[1]))
 		if err != nil {
-			webError(w, "putHandler: Could not create DAG from request", err, http.StatusInternalServerError)
+			webError(w, "postHandler: Could not create DAG from request", err, http.StatusInternalServerError)
 			return
 		}
 
 		e := dagutils.NewDagEditor(i.node.DAG, rnode)
 		err = e.InsertNodeAtPath(ctx, newPath, newnode, uio.NewEmptyDirectory)
 		if err != nil {
-			webError(w, "putHandler: InsertNodeAtPath failed", err, http.StatusInternalServerError)
+			webError(w, "postHandler: InsertNodeAtPath failed", err, http.StatusInternalServerError)
 			return
 		}
 
 		newkey, err = e.GetNode().Key()
 		if err != nil {
-			webError(w, "putHandler: could not get key of edited node", err, http.StatusInternalServerError)
+			webError(w, "postHandler: could not get key of edited node", err, http.StatusInternalServerError)
 			return
 		}
 
@@ -342,11 +324,11 @@ func (i *gatewayHandler) putHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			nnk, _ := newnode.Key()
 			rk, _ := rnode.Key()
-			webError(w, fmt.Sprintf("putHandler: Could not add newnode(%q) to root(%q)", nnk.B58String(), rk.B58String()), err, http.StatusInternalServerError)
+			webError(w, fmt.Sprintf("postHandler: Could not add newnode(%q) to root(%q)", nnk.B58String(), rk.B58String()), err, http.StatusInternalServerError)
 			return
 		}
 	default:
-		log.Warningf("putHandler: unhandled resolve error %T", ev)
+		log.Warningf("postHandler: unhandled resolve error %T", ev)
 		webError(w, "could not resolve root DAG", ev, http.StatusInternalServerError)
 		return
 	}
@@ -356,81 +338,56 @@ func (i *gatewayHandler) putHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, gopath.Join(ipfsPathPrefix, newkey.String(), newPath), http.StatusCreated)
 }
 
-func (i *gatewayHandler) deleteHandler(w http.ResponseWriter, r *http.Request) {
-	urlPath := r.URL.Path
-	ctx, cancel := context.WithCancel(i.node.Context())
-	defer cancel()
+var (
+	ErrIPNSNotSupported        = errors.New("writableGateway: /ipns/ not supported")
+	ErrNotMeaningfulOnWritable = errors.New("writableGateway: non-meaningful request")
+)
 
-	ipfsNode, err := core.Resolve(ctx, i.node, path.Path(urlPath))
+func (i *gatewayHandler) deleteHandler(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/ipfs" || r.URL.Path == ipfsPathPrefix {
+		webErrorWithCode(w, "HTTP DELETE of /ipfs is not meaningful", ErrNotMeaningfulOnWritable, http.StatusMethodNotAllowed)
+		return
+	}
+
+	rootPath, err := path.ParsePath(r.URL.Path)
 	if err != nil {
-		// FIXME HTTP error code
-		webError(w, "Could not resolve name", err, http.StatusInternalServerError)
+		webError(w, "deleteHandler: ipfs path not valid", err, http.StatusBadRequest)
 		return
 	}
 
-	k, err := ipfsNode.Key()
+	rsegs := rootPath.Segments()
+	if rsegs[0] == ipnsPathPrefix {
+		webError(w, "deleteHandler: updating named entries not supported", ErrIPNSNotSupported, http.StatusBadRequest)
+		return
+	}
+
+	if len(rsegs) == 2 { // /ipfs/$hash
+		webErrorWithCode(w, "HTTP DELETE of /ipfs/$hash is not meaningful", ErrNotMeaningfulOnWritable, http.StatusMethodNotAllowed)
+	}
+
+	rnode, err := i.node.DAG.Get(ctx, key.B58KeyDecode(rsegs[1]))
 	if err != nil {
-		webError(w, "Could not get key from resolved node", err, http.StatusInternalServerError)
+		webError(w, "deleteHandler: Could not create DAG from request", err, http.StatusInternalServerError)
 		return
 	}
 
-	h, components, err := path.SplitAbsPath(path.FromKey(k))
+	newPath := gopath.Join(rsegs[2:]...)
+
+	e := dagutils.NewDagEditor(i.node.DAG, rnode)
+	if err := e.RmLink(ctx, newPath); err != nil {
+		webError(w, "deleteHandler: dag editor failed to rmLink()", err, http.StatusInternalServerError)
+		return
+	}
+
+	newkey, err := e.GetNode().Key()
 	if err != nil {
-		webError(w, "Could not split path", err, http.StatusInternalServerError)
-		return
-	}
-
-	tctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	rootnd, err := i.node.Resolver.DAG.Get(tctx, key.Key(h))
-	if err != nil {
-		webError(w, "Could not resolve root object", err, http.StatusBadRequest)
-		return
-	}
-
-	// catches handler panic
-	if len(components) == 0 {
-		webError(w, "delete request not meaningful", fmt.Errorf("deleteHandler: empty path. %q", urlPath), http.StatusMethodNotAllowed)
-		return
-	}
-
-	pathNodes, err := i.node.Resolver.ResolveLinks(tctx, rootnd, components[:len(components)-1])
-	if err != nil {
-		webError(w, "Could not resolve parent object", err, http.StatusBadRequest)
-		return
-	}
-
-	// TODO(cyrptix): assumes len(pathNodes) > 1 - not found is an error above?
-	err = pathNodes[len(pathNodes)-1].RemoveNodeLink(components[len(components)-1])
-	if err != nil {
-		webError(w, "Could not delete link", err, http.StatusBadRequest)
-		return
-	}
-
-	newnode := pathNodes[len(pathNodes)-1]
-	for i := len(pathNodes) - 2; i >= 0; i-- {
-		newnode, err = pathNodes[i].UpdateNodeLink(components[i], newnode)
-		if err != nil {
-			webError(w, "Could not update node links", err, http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if err := i.node.DAG.AddRecursive(newnode); err != nil {
-		webError(w, "Could not add recursively new node", err, http.StatusInternalServerError)
-		return
-	}
-
-	// Redirect to new path
-	key, err := newnode.Key()
-	if err != nil {
-		webError(w, "Could not get key of new node", err, http.StatusInternalServerError)
+		webError(w, "deleteHandler: could not get key of edited node", err, http.StatusInternalServerError)
 		return
 	}
 
 	i.addUserHeaders(w) // ok, _now_ write user's headers.
-	w.Header().Set("IPFS-Hash", key.String())
-	http.Redirect(w, r, ipfsPathPrefix+key.String()+"/"+strings.Join(components[:len(components)-1], "/"), http.StatusCreated)
+	w.Header().Set("IPFS-Hash", newkey.String())
+	http.Redirect(w, r, gopath.Join(ipfsPathPrefix, newkey.String(), newPath), http.StatusCreated)
 }
 
 func (i *gatewayHandler) addUserHeaders(w http.ResponseWriter) {
@@ -453,8 +410,9 @@ func webError(w http.ResponseWriter, message string, err error, defaultCode int)
 
 func webErrorWithCode(w http.ResponseWriter, message string, err error, code int) {
 	w.WriteHeader(code)
-	log.Errorf("%s: %s", message, err) // TODO(cryptix): log errors until we have a better way to expose these (counter metrics maybe)
-	fmt.Fprintf(w, "%s: %s", message, err)
+	s := fmt.Sprintf("%s: %s", message, err)
+	log.Errorf(s) // TODO(cryptix): log errors until we have a better way to expose these (counter metrics maybe)
+	fmt.Fprint(w, s)
 }
 
 // return a 500 error and log
